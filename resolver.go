@@ -9,12 +9,14 @@ import (
 	"net/netip"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/miekg/dns"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/singleflight"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
 )
@@ -41,10 +43,7 @@ const (
 	ResolverTypeSDNS = "sdns"
 )
 
-const (
-	controldBootstrapDns = "76.76.2.22"
-	controldPublicDns    = "76.76.2.0"
-)
+const controldPublicDns = "76.76.2.0"
 
 var controldPublicDnsWithPort = net.JoinHostPort(controldPublicDns, "53")
 
@@ -219,6 +218,8 @@ func NewResolver(uc *UpstreamConfig) (Resolver, error) {
 type osResolver struct {
 	lanServers    atomic.Pointer[[]string]
 	publicServers atomic.Pointer[[]string]
+	group         *singleflight.Group
+	cache         *sync.Map
 }
 
 type osResolverResult struct {
@@ -276,10 +277,75 @@ func customDNSExchange(ctx context.Context, msg *dns.Msg, server string, desired
 	return dnsClient.ExchangeContext(ctx, msg, server)
 }
 
+const hotCacheTTL = time.Second
+
 // Resolve resolves DNS queries using pre-configured nameservers.
-// Query is sent to all nameservers concurrently, and the first
+// The Query is sent to all nameservers concurrently, and the first
 // success response will be returned.
+//
+// To guard against unexpected DoS to upstreams, multiple queries of
+// the same Qtype to a domain will be shared, so there's only 1 qps
+// for each upstream at any time.
+//
+// Further, a hot cache will be used, so repeated queries will be cached
+// for a short period (currently 1 second), reducing unnecessary traffics
+// sent to upstreams.
 func (o *osResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
+	if len(msg.Question) == 0 {
+		return nil, errors.New("no question found")
+	}
+	domain := strings.TrimSuffix(msg.Question[0].Name, ".")
+	qtype := msg.Question[0].Qtype
+
+	// Unique key for the singleflight group.
+	key := fmt.Sprintf("%s:%d:", domain, qtype)
+
+	// Checking the cache first.
+	if val, ok := o.cache.Load(key); ok {
+		if val, ok := val.(*dns.Msg); ok {
+			Log(ctx, ProxyLogger.Load().Debug(), "hit hot cached result: %s - %s", domain, dns.TypeToString[qtype])
+			res := val.Copy()
+			SetCacheReply(res, msg, val.Rcode)
+			return res, nil
+		}
+	}
+
+	// Ensure only one DNS query is in flight for the key.
+	v, err, shared := o.group.Do(key, func() (interface{}, error) {
+		msg, err := o.resolve(ctx, msg)
+		if err != nil {
+			return nil, err
+		}
+		// If we got an answer, storing it to the hot cache for hotCacheTTL
+		// This prevents possible DoS to upstream, ensuring there's only 1 QPS.
+		o.cache.Store(key, msg)
+		// Depends on go runtime scheduling, the result may end up in hot cache longer
+		// than hotCacheTTL duration. However, this is fine since we only want to guard
+		// against DoS attack. The result will be cleaned from the cache eventually.
+		time.AfterFunc(hotCacheTTL, func() {
+			o.removeCache(key)
+		})
+		return msg, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	sharedMsg, ok := v.(*dns.Msg)
+	if !ok {
+		return nil, fmt.Errorf("invalid answer for key: %s", key)
+	}
+	res := sharedMsg.Copy()
+	SetCacheReply(res, msg, sharedMsg.Rcode)
+	if shared {
+		Log(ctx, ProxyLogger.Load().Debug(), "shared result: %s - %s", domain, dns.TypeToString[qtype])
+	}
+
+	return res, nil
+}
+
+// resolve sends the query to current nameservers.
+func (o *osResolver) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
 	publicServers := *o.publicServers.Load()
 	var nss []string
 	if p := o.lanServers.Load(); p != nil {
@@ -434,13 +500,17 @@ func (o *osResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error
 	return nil, errors.Join(errs...)
 }
 
+func (o *osResolver) removeCache(key string) {
+	o.cache.Delete(key)
+}
+
 type legacyResolver struct {
 	uc *UpstreamConfig
 }
 
 func (r *legacyResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
 	// See comment in (*dotResolver).resolve method.
-	dialer := newDialer(net.JoinHostPort(controldBootstrapDns, "53"))
+	dialer := newDialer(net.JoinHostPort(controldPublicDns, "53"))
 	dnsTyp := uint16(0)
 	if msg != nil && len(msg.Question) > 0 {
 		dnsTyp = msg.Question[0].Qtype
@@ -469,27 +539,41 @@ func (d dummyResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, err
 	return ans, nil
 }
 
-// LookupIP looks up host using OS resolver.
+// LookupIP looks up domain using current system nameservers settings.
 // It returns a slice of that host's IPv4 and IPv6 addresses.
 func LookupIP(domain string) []string {
-	return lookupIP(domain, -1, true)
+	nss := initDefaultOsResolver()
+	return lookupIP(domain, -1, nss)
 }
 
-func lookupIP(domain string, timeout int, withBootstrapDNS bool) (ips []string) {
+// initDefaultOsResolver initializes the default OS resolver with system's default nameservers if it hasn't been initialized yet.
+// It returns the combined list of LAN and public nameservers currently held by the resolver.
+func initDefaultOsResolver() []string {
 	resolverMutex.Lock()
+	defer resolverMutex.Unlock()
 	if or == nil {
-		ProxyLogger.Load().Debug().Msgf("Initialize OS resolver in lookupIP")
+		ProxyLogger.Load().Debug().Msgf("Initialize new OS resolver with default nameservers")
 		or = newResolverWithNameserver(defaultNameservers())
 	}
-	resolverMutex.Unlock()
-
 	nss := *or.lanServers.Load()
 	nss = append(nss, *or.publicServers.Load()...)
-	if withBootstrapDNS {
-		nss = append([]string{net.JoinHostPort(controldBootstrapDns, "53")}, nss...)
+	return nss
+}
+
+// lookupIP looks up domain with given timeout and bootstrapDNS.
+// If the timeout is negative, default timeout 2000 ms will be used.
+// It returns nil if bootstrapDNS is nil or empty.
+func lookupIP(domain string, timeout int, bootstrapDNS []string) (ips []string) {
+	if net.ParseIP(domain) != nil {
+		return []string{domain}
 	}
-	resolver := newResolverWithNameserver(nss)
-	ProxyLogger.Load().Debug().Msgf("resolving %q using bootstrap DNS %q", domain, nss)
+	if bootstrapDNS == nil {
+		ProxyLogger.Load().Debug().Msgf("empty bootstrap DNS")
+		return nil
+	}
+
+	resolver := newResolverWithNameserver(bootstrapDNS)
+	ProxyLogger.Load().Debug().Msgf("resolving %q using bootstrap DNS %q", domain, bootstrapDNS)
 	timeoutMs := 2000
 	if timeout > 0 && timeout < timeoutMs {
 		timeoutMs = timeout
@@ -581,13 +665,8 @@ func NewBootstrapResolver(servers ...string) Resolver {
 //
 // This is useful for doing PTR lookup in LAN network.
 func NewPrivateResolver() Resolver {
-
-	logger := *ProxyLogger.Load()
-
-	Log(context.Background(), logger.Debug(), "NewPrivateResolver called")
-
-	nss := defaultNameservers()
-	resolveConfNss := nameserversFromResolvconf()
+	nss := initDefaultOsResolver()
+	resolveConfNss := currentNameserversFromResolvconf()
 	localRfc1918Addrs := Rfc1918Addresses()
 	n := 0
 	for _, ns := range nss {
@@ -630,10 +709,10 @@ func NewResolverWithNameserver(nameservers []string) Resolver {
 // newResolverWithNameserver returns an OS resolver from given nameservers list.
 // The caller must ensure each server in list is formed "ip:53".
 func newResolverWithNameserver(nameservers []string) *osResolver {
-	logger := *ProxyLogger.Load()
-
-	Log(context.Background(), logger.Debug(), "newResolverWithNameserver called with nameservers: %v", nameservers)
-	r := &osResolver{}
+	r := &osResolver{
+		group: &singleflight.Group{},
+		cache: &sync.Map{},
+	}
 	var publicNss []string
 	var lanNss []string
 	for _, ns := range slices.Sorted(slices.Values(nameservers)) {
@@ -650,10 +729,15 @@ func newResolverWithNameserver(nameservers []string) *osResolver {
 	return r
 }
 
-// Rfc1918Addresses returns the list of local interfaces private IP addresses
+// Rfc1918Addresses returns the list of local physical interfaces private IP addresses
 func Rfc1918Addresses() []string {
+	vis := validInterfaces()
 	var res []string
 	netmon.ForeachInterface(func(i netmon.Interface, prefixes []netip.Prefix) {
+		// Skip virtual interfaces.
+		if _, existed := vis[i.Name]; !existed {
+			return
+		}
 		addrs, _ := i.Addrs()
 		for _, addr := range addrs {
 			ipNet, ok := addr.(*net.IPNet)

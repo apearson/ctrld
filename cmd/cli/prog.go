@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"os/exec"
 	"runtime"
 	"slices"
 	"sort"
@@ -21,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/kardianos/service"
 	"github.com/rs/zerolog"
 	"github.com/spf13/viper"
@@ -33,6 +35,7 @@ import (
 	"github.com/Control-D-Inc/ctrld/internal/controld"
 	"github.com/Control-D-Inc/ctrld/internal/dnscache"
 	"github.com/Control-D-Inc/ctrld/internal/router"
+	"github.com/Control-D-Inc/ctrld/internal/router/dnsmasq"
 )
 
 const (
@@ -68,9 +71,16 @@ func ControlSocketName() string {
 	}
 }
 
+// logf is a function variable used for logging formatted debug messages with optional arguments.
+// This is used only when creating a new DNS OS configurator.
 var logf = func(format string, args ...any) {
 	mainLog.Load().Debug().Msgf(format, args...)
 }
+
+// noopLogf is like logf but discards formatted log messages and arguments without any processing.
+//
+//lint:ignore U1000 use in newLoopbackOSConfigurator
+var noopLogf = func(format string, args ...any) {}
 
 var svcConfig = &service.Config{
 	Name:        ctrldServiceName,
@@ -85,6 +95,7 @@ type prog struct {
 	mu                   sync.Mutex
 	waitCh               chan struct{}
 	stopCh               chan struct{}
+	pinCodeValidCh       chan struct{}
 	reloadCh             chan struct{} // For Windows.
 	reloadDoneCh         chan struct{}
 	apiReloadCh          chan *ctrld.Config
@@ -266,13 +277,6 @@ func (p *prog) preRun() {
 		p.requiredMultiNICsConfig = requiredMultiNICsConfig()
 	}
 	p.runningIface = iface
-	if runtime.GOOS == "darwin" {
-		p.onStopped = append(p.onStopped, func() {
-			if !service.Interactive() {
-				p.resetDNS(false, true)
-			}
-		})
-	}
 }
 
 func (p *prog) postRun() {
@@ -304,6 +308,16 @@ func (p *prog) apiConfigReload() {
 	logger := mainLog.Load().With().Str("mode", "api-reload").Logger()
 	logger.Debug().Msg("starting custom config reload timer")
 	lastUpdated := time.Now().Unix()
+	curVerStr := curVersion()
+	curVer, err := semver.NewVersion(curVerStr)
+	isStable := curVer != nil && curVer.Prerelease() == ""
+	if err != nil || !isStable {
+		l := mainLog.Load().Warn()
+		if err != nil {
+			l = l.Err(err)
+		}
+		l.Msgf("current version is not stable, skipping self-upgrade: %s", curVerStr)
+	}
 
 	doReloadApiConfig := func(forced bool, logger zerolog.Logger) {
 		resolverConfig, err := controld.FetchResolverConfig(cdUID, rootCmd.Version, cdDev)
@@ -311,6 +325,11 @@ func (p *prog) apiConfigReload() {
 		if err != nil {
 			logger.Warn().Err(err).Msg("could not fetch resolver config")
 			return
+		}
+
+		// Performing self-upgrade check for production version.
+		if isStable {
+			_ = selfUpgradeCheck(resolverConfig.Ctrld.VersionTarget, curVer, &logger)
 		}
 
 		if resolverConfig.DeactivationPin != nil {
@@ -511,6 +530,15 @@ func (p *prog) run(reload bool, reloadCh chan struct{}) {
 		go p.watchLinkState(ctx)
 	}
 
+	if !reload {
+		go func() {
+			// Start network monitoring
+			if err := p.monitorNetworkChanges(); err != nil {
+				mainLog.Load().Error().Err(err).Msg("Failed to start network monitoring")
+			}
+		}()
+	}
+
 	for listenerNum := range p.cfg.Listener {
 		p.cfg.Listener[listenerNum].Init()
 		if !reload {
@@ -522,7 +550,7 @@ func (p *prog) run(reload bool, reloadCh chan struct{}) {
 				}
 				addr := net.JoinHostPort(listenerConfig.IP, strconv.Itoa(listenerConfig.Port))
 				mainLog.Load().Info().Msgf("starting DNS server on listener.%s: %s", listenerNum, addr)
-				if err := p.serveDNS(ctx, listenerNum); err != nil {
+				if err := p.serveDNS(listenerNum); err != nil {
 					mainLog.Load().Fatal().Err(err).Msgf("unable to start dns proxy on listener.%s", listenerNum)
 				}
 				mainLog.Load().Debug().Msgf("end of serveDNS listener.%s: %s", listenerNum, addr)
@@ -589,6 +617,12 @@ func (p *prog) setupClientInfoDiscover(selfIP string) {
 		format := ctrld.LeaseFileFormat(p.cfg.Service.DHCPLeaseFileFormat)
 		p.ciTable.AddLeaseFile(leaseFile, format)
 	}
+	if leaseFiles := dnsmasq.AdditionalLeaseFiles(); len(leaseFiles) > 0 {
+		mainLog.Load().Debug().Msgf("watching additional lease files: %v", leaseFiles)
+		for _, leaseFile := range leaseFiles {
+			p.ciTable.AddLeaseFile(leaseFile, ctrld.Dnsmasq)
+		}
+	}
 }
 
 // runClientInfoDiscover runs the client info discover.
@@ -605,14 +639,41 @@ func (p *prog) metricsEnabled() bool {
 func (p *prog) Stop(s service.Service) error {
 	p.stopDnsWatchers()
 	mainLog.Load().Debug().Msg("dns watchers stopped")
+	for _, f := range p.onStopped {
+		f()
+	}
+	mainLog.Load().Debug().Msg("finish running onStopped functions")
 	defer func() {
 		mainLog.Load().Info().Msg("Service stopped")
 	}()
-	close(p.stopCh)
 	if err := p.deAllocateIP(); err != nil {
 		mainLog.Load().Error().Err(err).Msg("de-allocate ip failed")
 		return err
 	}
+	if deactivationPinSet() {
+		select {
+		case <-p.pinCodeValidCh:
+			// Allow stopping the service, pinCodeValidCh is only filled
+			// after control server did validate the pin code.
+		case <-time.After(time.Millisecond * 100):
+			// No valid pin code was checked, that mean we are stopping
+			// because of OS signal sent directly from someone else.
+			// In this case, restarting ctrld service by ourselves.
+			mainLog.Load().Debug().Msgf("receiving stopping signal without valid pin code")
+			mainLog.Load().Debug().Msgf("self restarting ctrld service")
+			if exe, err := os.Executable(); err == nil {
+				cmd := exec.Command(exe, "restart")
+				cmd.SysProcAttr = sysProcAttrForDetachedChildProcess()
+				if err := cmd.Start(); err != nil {
+					mainLog.Load().Error().Err(err).Msg("failed to run self restart command")
+				}
+			} else {
+				mainLog.Load().Error().Err(err).Msg("failed to self restart ctrld service")
+			}
+			os.Exit(deactivationPinInvalidExitCode)
+		}
+	}
+	close(p.stopCh)
 	return nil
 }
 
@@ -1420,6 +1481,77 @@ func selfUninstallCheck(uninstallErr error, p *prog, logger zerolog.Logger) {
 		// Perform self-uninstall now.
 		selfUninstall(p, logger)
 	}
+}
+
+// shouldUpgrade checks if the version target vt is greater than the current one cv.
+// Major version upgrades are not allowed to prevent breaking changes.
+//
+// The callers must ensure curVer and logger are non-nil.
+// Returns true if upgrade is allowed, false otherwise.
+func shouldUpgrade(vt string, cv *semver.Version, logger *zerolog.Logger) bool {
+	if vt == "" {
+		logger.Debug().Msg("no version target set, skipped checking self-upgrade")
+		return false
+	}
+	vts := vt
+	if !strings.HasPrefix(vts, "v") {
+		vts = "v" + vts
+	}
+	targetVer, err := semver.NewVersion(vts)
+	if err != nil {
+		logger.Warn().Err(err).Msgf("invalid target version, skipped self-upgrade: %s", vt)
+		return false
+	}
+
+	// Prevent major version upgrades to avoid breaking changes
+	if targetVer.Major() != cv.Major() {
+		logger.Warn().
+			Str("target", vt).
+			Str("current", cv.String()).
+			Msgf("major version upgrade not allowed (target: %d, current: %d), skipped self-upgrade", targetVer.Major(), cv.Major())
+		return false
+	}
+
+	if !targetVer.GreaterThan(cv) {
+		logger.Debug().
+			Str("target", vt).
+			Str("current", cv.String()).
+			Msgf("target version is not greater than current one, skipped self-upgrade")
+		return false
+	}
+
+	return true
+}
+
+// performUpgrade executes the self-upgrade command.
+// Returns true if upgrade was initiated successfully, false otherwise.
+func performUpgrade(vt string) bool {
+	exe, err := os.Executable()
+	if err != nil {
+		mainLog.Load().Error().Err(err).Msg("failed to get executable path, skipped self-upgrade")
+		return false
+	}
+	cmd := exec.Command(exe, "upgrade", "prod", "-vv")
+	cmd.SysProcAttr = sysProcAttrForDetachedChildProcess()
+	if err := cmd.Start(); err != nil {
+		mainLog.Load().Error().Err(err).Msg("failed to start self-upgrade")
+		return false
+	}
+	mainLog.Load().Debug().Msgf("self-upgrade triggered, version target: %s", vt)
+	return true
+}
+
+// selfUpgradeCheck checks if the version target vt is greater
+// than the current one cv, perform self-upgrade then.
+// Major version upgrades are not allowed to prevent breaking changes.
+//
+// The callers must ensure curVer and logger are non-nil.
+// Returns true if upgrade is allowed and should proceed, false otherwise.
+func selfUpgradeCheck(vt string, cv *semver.Version, logger *zerolog.Logger) bool {
+	if shouldUpgrade(vt, cv, logger) {
+		return performUpgrade(vt)
+	}
+	return false
 }
 
 // leakOnUpstreamFailure reports whether ctrld should initiate a recovery flow

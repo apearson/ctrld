@@ -84,13 +84,7 @@ type upstreamForResult struct {
 	srcAddr        string
 }
 
-func (p *prog) serveDNS(mainCtx context.Context, listenerNum string) error {
-	// Start network monitoring
-	if err := p.monitorNetworkChanges(mainCtx); err != nil {
-		mainLog.Load().Error().Err(err).Msg("Failed to start network monitoring")
-		// Don't return here as we still want DNS service to run
-	}
-
+func (p *prog) serveDNS(listenerNum string) error {
 	listenerConfig := p.cfg.Listener[listenerNum]
 	// make sure ip is allocated
 	if allocErr := p.allocateIP(listenerConfig.IP); allocErr != nil {
@@ -213,8 +207,8 @@ func (p *prog) serveDNS(mainCtx context.Context, listenerNum string) error {
 				return nil
 			})
 		}
-		// When we spawn a listener on 127.0.0.1, also spawn listeners on the RFC1918
-		// addresses of the machine. So ctrld could receive queries from LAN clients.
+		// When we spawn a listener on 127.0.0.1, also spawn listeners on the RFC1918 addresses of the machine
+		// if explicitly set via setting rfc1918 flag, so ctrld could receive queries from LAN clients.
 		if needRFC1918Listeners(listenerConfig) {
 			g.Go(func() error {
 				for _, addr := range ctrld.Rfc1918Addresses() {
@@ -500,7 +494,7 @@ func (p *prog) proxy(ctx context.Context, req *proxyRequest) *proxyResponse {
 				continue
 			}
 			answer := cachedValue.Msg.Copy()
-			answer.SetRcode(req.msg, answer.Rcode)
+			ctrld.SetCacheReply(answer, req.msg, answer.Rcode)
 			now := time.Now()
 			if cachedValue.Expire.After(now) {
 				ctrld.Log(ctx, mainLog.Load().Debug(), "hit cached response")
@@ -519,13 +513,8 @@ func (p *prog) proxy(ctx context.Context, req *proxyRequest) *proxyResponse {
 			ctrld.Log(ctx, mainLog.Load().Error().Err(err), "failed to create resolver")
 			return nil, err
 		}
-		resolveCtx, cancel := context.WithCancel(ctx)
+		resolveCtx, cancel := upstreamConfig.Context(ctx)
 		defer cancel()
-		if upstreamConfig.Timeout > 0 {
-			timeoutCtx, cancel := context.WithTimeout(resolveCtx, time.Millisecond*time.Duration(upstreamConfig.Timeout))
-			defer cancel()
-			resolveCtx = timeoutCtx
-		}
 		return dnsResolver.Resolve(resolveCtx, msg)
 	}
 	resolve := func(upstream string, upstreamConfig *ctrld.UpstreamConfig, msg *dns.Msg) *dns.Msg {
@@ -555,6 +544,10 @@ func (p *prog) proxy(ctx context.Context, req *proxyRequest) *proxyResponse {
 			var e net.Error
 			if errors.As(err, &e) && e.Timeout() {
 				upstreamConfig.ReBootstrap()
+			}
+			// For network error, turn ipv6 off if enabled.
+			if ctrld.HasIPv6() && (errUrlNetworkError(err) || errNetworkError(err)) {
+				ctrld.DisableIPv6()
 			}
 		}
 
@@ -1043,8 +1036,10 @@ func (p *prog) queryFromSelf(ip string) bool {
 	return false
 }
 
+// needRFC1918Listeners reports whether ctrld need to spawn listener for RFC 1918 addresses.
+// This is helpful for non-desktop platforms to receive queries from LAN clients.
 func needRFC1918Listeners(lc *ctrld.ListenerConfig) bool {
-	return lc.IP == "127.0.0.1" && lc.Port == 53
+	return rfc1918 && lc.IP == "127.0.0.1" && lc.Port == 53
 }
 
 // ipFromARPA parses a FQDN arpa domain and return the IP address if valid.
@@ -1186,7 +1181,7 @@ func FlushDNSCache() error {
 }
 
 // monitorNetworkChanges starts monitoring for network interface changes
-func (p *prog) monitorNetworkChanges(ctx context.Context) error {
+func (p *prog) monitorNetworkChanges() error {
 	mon, err := netmon.New(func(format string, args ...any) {
 		// Always fetch the latest logger (and inject the prefix)
 		mainLog.Load().Printf("netmon: "+format, args...)
@@ -1405,9 +1400,6 @@ func (p *prog) checkUpstreamOnce(upstream string, uc *ctrld.UpstreamConfig) erro
 		return err
 	}
 
-	msg := new(dns.Msg)
-	msg.SetQuestion(".", dns.TypeNS)
-
 	timeout := 1000 * time.Millisecond
 	if uc.Timeout > 0 {
 		timeout = time.Millisecond * time.Duration(uc.Timeout)
@@ -1421,6 +1413,7 @@ func (p *prog) checkUpstreamOnce(upstream string, uc *ctrld.UpstreamConfig) erro
 	mainLog.Load().Debug().Msgf("Rebootstrapping resolver for upstream: %s", upstream)
 
 	start := time.Now()
+	msg := uc.VerifyMsg()
 	_, err = resolver.Resolve(ctx, msg)
 	duration := time.Since(start)
 

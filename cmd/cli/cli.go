@@ -25,7 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Masterminds/semver"
+	"github.com/Masterminds/semver/v3"
 	"github.com/cuonglm/osinfo"
 	"github.com/go-playground/validator/v10"
 	"github.com/kardianos/service"
@@ -96,6 +96,9 @@ var rootCmd = &cobra.Command{
 func curVersion() string {
 	if version != "dev" && !strings.HasPrefix(version, "v") {
 		version = "v" + version
+	}
+	if version != "" && version != "dev" {
+		return version
 	}
 	if len(commit) > 7 {
 		commit = commit[:7]
@@ -175,7 +178,15 @@ func RunMobile(appConfig *AppConfig, appCallback *AppCallback, stopCh chan struc
 	noConfigStart = false
 	homedir = appConfig.HomeDir
 	verbose = appConfig.Verbose
-	cdUID = appConfig.CdUID
+	if appConfig.ProvisionID != "" {
+		cdOrg = appConfig.ProvisionID
+	}
+	if appConfig.CustomHostname != "" {
+		customHostname = appConfig.CustomHostname
+	}
+	if appConfig.CdUID != "" {
+		cdUID = appConfig.CdUID
+	}
 	cdUpstreamProto = appConfig.UpstreamProto
 	logPath = appConfig.LogPath
 	run(appCallback, stopCh)
@@ -199,6 +210,7 @@ func run(appCallback *AppCallback, stopCh chan struct{}) {
 	p := &prog{
 		waitCh:           waitCh,
 		stopCh:           stopCh,
+		pinCodeValidCh:   make(chan struct{}, 1),
 		reloadCh:         make(chan struct{}),
 		reloadDoneCh:     make(chan struct{}),
 		dnsWatcherStopCh: make(chan struct{}),
@@ -223,7 +235,9 @@ func run(appCallback *AppCallback, stopCh chan struct{}) {
 			consoleWriter.Out = io.MultiWriter(os.Stdout, lc)
 			p.logConn = lc
 		} else {
-			mainLog.Load().Warn().Err(err).Msgf("unable to create log ipc connection")
+			if !errors.Is(err, os.ErrNotExist) {
+				mainLog.Load().Warn().Err(err).Msg("unable to create log ipc connection")
+			}
 		}
 	} else {
 		mainLog.Load().Warn().Err(err).Msgf("unable to resolve socket address: %s", sockPath)
@@ -421,19 +435,28 @@ func run(appCallback *AppCallback, stopCh chan struct{}) {
 				if err := p.router.Cleanup(); err != nil {
 					mainLog.Load().Error().Err(err).Msg("could not cleanup router")
 				}
-				// restore static DNS settings or DHCP
-				p.resetDNS(false, true)
 			})
 		}
 	}
+	p.onStopped = append(p.onStopped, func() {
+		// restore static DNS settings or DHCP
+		p.resetDNS(false, true)
+		// Iterate over all physical interfaces and restore static DNS if a saved static config exists.
+		withEachPhysicalInterfaces("", "restore static DNS", func(i *net.Interface) error {
+			file := savedStaticDnsSettingsFilePath(i)
+			if _, err := os.Stat(file); err == nil {
+				if err := restoreDNS(i); err != nil {
+					mainLog.Load().Error().Err(err).Msgf("Could not restore static DNS on interface %s", i.Name)
+				} else {
+					mainLog.Load().Debug().Msgf("Restored static DNS on interface %s successfully", i.Name)
+				}
+			}
+			return nil
+		})
+	})
 
 	close(waitCh)
 	<-stopCh
-
-	p.stopDnsWatchers()
-	for _, f := range p.onStopped {
-		f()
-	}
 }
 
 func writeConfigFile(cfg *ctrld.Config) error {
@@ -609,9 +632,9 @@ func init() {
 	cdDeactivationPin.Store(defaultDeactivationPin)
 }
 
-// deactivationPinNotSet reports whether cdDeactivationPin was not set by processCDFlags.
-func deactivationPinNotSet() bool {
-	return cdDeactivationPin.Load() == defaultDeactivationPin
+// deactivationPinSet indicates if cdDeactivationPin is non-default..
+func deactivationPinSet() bool {
+	return cdDeactivationPin.Load() != defaultDeactivationPin
 }
 
 func processCDFlags(cfg *ctrld.Config) (*controld.ResolverConfig, error) {
@@ -1061,7 +1084,7 @@ func uninstall(p *prog, s service.Service) {
 		p.resetDNS(false, true)
 
 		// Iterate over all physical interfaces and restore DNS if a saved static config exists.
-		withEachPhysicalInterfaces("", "restore static DNS", func(i *net.Interface) error {
+		withEachPhysicalInterfaces(p.runningIface, "restore static DNS", func(i *net.Interface) error {
 			file := savedStaticDnsSettingsFilePath(i)
 			if _, err := os.Stat(file); err == nil {
 				if err := restoreDNS(i); err != nil {
@@ -1201,13 +1224,18 @@ func tryUpdateListenerConfig(cfg *ctrld.Config, infoLogger *zerolog.Logger, noti
 	// For Windows server with local Dns server running, we can only try on random local IP.
 	hasLocalDnsServer := hasLocalDnsServerRunning()
 	notRouter := router.Name() == ""
+	isDesktop := ctrld.IsDesktopPlatform()
 	for n, listener := range cfg.Listener {
 		lcc[n] = &listenerConfigCheck{}
 		if listener.IP == "" {
 			listener.IP = "0.0.0.0"
-			if hasLocalDnsServer {
-				// Windows Server lies to us that we could listen on 0.0.0.0:53
-				// even there's a process already done that, stick to local IP only.
+			// Windows Server lies to us that we could listen on 0.0.0.0:53
+			// even there's a process already done that, stick to local IP only.
+			//
+			// For desktop clients, also stick the listener to the local IP only.
+			// Listening on 0.0.0.0 would expose it to the entire local network, potentially
+			// creating security vulnerabilities (such as DNS amplification or abusing).
+			if hasLocalDnsServer || isDesktop {
 				listener.IP = "127.0.0.1"
 			}
 			lcc[n].IP = true

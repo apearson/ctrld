@@ -2,29 +2,49 @@ package ctrld
 
 import (
 	"net/url"
-	"os"
 	"testing"
 
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestUpstreamConfig_SetupBootstrapIP(t *testing.T) {
-	l := zerolog.New(os.Stdout)
-	ProxyLogger.Store(&l)
-	uc := &UpstreamConfig{
-		Name:     "test",
-		Type:     ResolverTypeDOH,
-		Endpoint: "https://freedns.controld.com/p2",
-		Timeout:  5000,
+	tests := []struct {
+		name string
+		uc   *UpstreamConfig
+	}{
+		{
+			name: "doh/doh3",
+			uc: &UpstreamConfig{
+				Name:     "doh",
+				Type:     ResolverTypeDOH,
+				Endpoint: "https://freedns.controld.com/p2",
+				Timeout:  5000,
+			},
+		},
+		{
+			name: "doq/dot",
+			uc: &UpstreamConfig{
+				Name:     "dot",
+				Type:     ResolverTypeDOT,
+				Endpoint: "p2.freedns.controld.com",
+				Timeout:  5000,
+			},
+		},
 	}
-	uc.Init()
-	uc.setupBootstrapIP(false)
-	if len(uc.bootstrapIPs) == 0 {
-		t.Log(defaultNameservers())
-		t.Fatal("could not bootstrap ip without bootstrap DNS")
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			// Enable parallel tests once https://github.com/microsoft/wmi/issues/165 fixed.
+			// t.Parallel()
+			tc.uc.Init()
+			tc.uc.SetupBootstrapIP()
+			if len(tc.uc.bootstrapIPs) == 0 {
+				t.Log(defaultNameservers())
+				t.Fatalf("could not bootstrap ip: %s", tc.uc.String())
+			}
+		})
 	}
-	t.Log(uc)
+
 }
 
 func TestUpstreamConfig_Init(t *testing.T) {
